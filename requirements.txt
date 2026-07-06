@@ -1,12 +1,24 @@
+# Build-time dependencies (must be installed before packages that compile C extensions)
+cython>=3.0.0
+
+# Core app dependencies
 gradio>=4.0.0
 edge-tts>=6.1.0
 fastapi>=0.100.0
 uvicorn>=0.23.0
 httpx>=0.24.0
 pydantic>=2.0.0
+
+# PyTorch (CPU-friendly; use torch index for GPU if needed)
 torch>=2.0.0
 torchaudio>=2.0.0
-kokoro>=0.1.0
+
+# Kokoro TTS and its NLP dependencies pinned for Python 3.12+ compatibility
+kokoro>=0.9.2
+spacy>=3.8.0
+thinc>=8.3.0
+
+# Audio / numeric utilities
 soundfile
-numpy
-scipy
+numpy>=1.26.0,<2.0.0
+scipy>=1.11.0
