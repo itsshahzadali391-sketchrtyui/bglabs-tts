@@ -1,3 +1,12 @@
 gradio>=4.0.0
 edge-tts>=6.1.0
-mutagen>=1.47.0
+fastapi>=0.100.0
+uvicorn>=0.23.0
+httpx>=0.24.0
+pydantic>=2.0.0
+torch>=2.0.0
+torchaudio>=2.0.0
+kokoro>=0.1.0
+soundfile
+numpy
+scipy

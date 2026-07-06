@@ -1,0 +1,10 @@
+﻿services:
+  - type: web
+    name: bglabs-tts
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: ELEVENLABS_API_KEY
+        sync: false

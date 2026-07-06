@@ -3,15 +3,19 @@ import edge_tts
 import asyncio
 import os
 import time
-import json
+import httpx
+import torch
+import tempfile
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from pathlib import Path
 
 OUTPUT_DIR = "outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
 
 MICROSOFT_VOICES = {
     "Guy (Male)": "en-US-GuyNeural",
@@ -41,8 +45,24 @@ MICROSOFT_VOICES = {
     "Sam (Male)": "en-US-SamNeural",
 }
 
-# ===== FastAPI Backend =====
-api = FastAPI(title="BG LABS TTS API")
+ELEVENLABS_VOICES = {
+    "Rachel": "21m00Tcm4TlvDq8ikWAM",
+    "Domi": "AZnzlk1XvdvUeBnXmlld",
+    "Bella": "EXAVITQu4vr4xnSDxMaL",
+    "Antoni": "ErXwobaYiN019PkySvjV",
+    " Elli": "MF3mGyEYCl7XYWbV9V6O",
+    "Josh": "TxGEqnHWrfWFTfGW9XjX",
+    "Arnold": "VR6AewLTigWG4xSOukaG",
+    "Adam": "pNInz6obpgDQGcFmaJgB",
+    "Sam": "yoZ06aMxZJJ28mfd3POQ",
+}
+
+KOKORO_VOICES = ["af_heart", "af_bella", "af_nicole", "af_sarah", "af_sky",
+                 "am_adam", "am_michael", "bf_emma", "bf_isabella", "bm_george", "bm_lewis"]
+
+models_cache = {}
+
+api = FastAPI(title="BG LABS TTS API v3")
 api.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 class TTSRequest(BaseModel):
@@ -51,13 +71,34 @@ class TTSRequest(BaseModel):
     rate: int = 0
     pitch: int = 0
 
+class ElevenLabsRequest(BaseModel):
+    text: str
+    voice_id: str = "21m00Tcm4TlvDq8ikWAM"
+    model_id: str = "eleven_monolingual_v1"
+    speed: float = 1.0
+
+class CloneRequest(BaseModel):
+    text: str
+    voice_id: str
+
+# ===== API Endpoints =====
+
 @api.get("/api/health")
 async def health():
-    return {"status": "ok", "service": "BG LABS TTS", "version": "2.0", "voices": len(MICROSOFT_VOICES)}
+    return {
+        "status": "ok",
+        "service": "BG LABS TTS v3",
+        "providers": ["edge-tts", "elevenlabs", "kokoro"],
+        "elevenlabs_configured": bool(ELEVENLABS_API_KEY)
+    }
 
 @api.get("/api/voices")
 async def get_voices():
-    return {"voices": [{"name": k, "id": v} for k, v in MICROSOFT_VOICES.items()]}
+    return {
+        "edge_voices": [{"name": k, "id": v} for k, v in MICROSOFT_VOICES.items()],
+        "elevenlabs_voices": [{"name": k, "id": v} for k, v in ELEVENLABS_VOICES.items()],
+        "kokoro_voices": KOKORO_VOICES
+    }
 
 @api.post("/api/tts")
 async def generate_tts(req: TTSRequest):
@@ -68,7 +109,7 @@ async def generate_tts(req: TTSRequest):
     pitch_str = f"+{req.pitch}Hz" if req.pitch >= 0 else f"{req.pitch}Hz"
     
     timestamp = int(time.time() * 1000)
-    output_file = os.path.join(OUTPUT_DIR, f"tts_{timestamp}.mp3")
+    output_file = os.path.join(OUTPUT_DIR, f"edge_{timestamp}.mp3")
     
     try:
         communicate = edge_tts.Communicate(req.text, req.voice, rate=rate_str, pitch=pitch_str)
@@ -77,68 +118,205 @@ async def generate_tts(req: TTSRequest):
     except Exception as e:
         raise HTTPException(500, str(e))
 
-@api.post("/api/tts/url")
-async def generate_tts_url(req: TTSRequest):
+@api.post("/api/elevenlabs")
+async def generate_elevenlabs(req: ElevenLabsRequest):
+    if not ELEVENLABS_API_KEY:
+        raise HTTPException(500, "ElevenLabs API key not configured")
     if not req.text or not req.text.strip():
         raise HTTPException(400, "Text is required")
     
-    rate_str = f"+{req.rate}%" if req.rate >= 0 else f"{req.rate}%"
-    pitch_str = f"+{req.pitch}Hz" if req.pitch >= 0 else f"{req.pitch}Hz"
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{req.voice_id}"
+    headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
+    payload = {
+        "text": req.text,
+        "model_id": req.model_id,
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75, "speed": req.speed}
+    }
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, json=payload, headers=headers, timeout=30)
+    
+    if response.status_code != 200:
+        raise HTTPException(response.status_code, "ElevenLabs API error")
     
     timestamp = int(time.time() * 1000)
-    output_file = os.path.join(OUTPUT_DIR, f"tts_{timestamp}.mp3")
+    output_file = os.path.join(OUTPUT_DIR, f"eleven_{timestamp}.mp3")
+    with open(output_file, "wb") as f:
+        f.write(response.content)
+    
+    return FileResponse(output_file, media_type="audio/mpeg", filename="speech.mp3")
+
+@api.post("/api/elevenlabs/clone")
+async def clone_voice(req: CloneRequest):
+    if not ELEVENLABS_API_KEY:
+        raise HTTPException(500, "ElevenLabs API key not configured")
+    if not req.text or not req.text.strip():
+        raise HTTPException(400, "Text is required")
+    
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{req.voice_id}"
+    headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
+    payload = {
+        "text": req.text,
+        "model_id": "eleven_multilingual_v2",
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
+    }
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, json=payload, headers=headers, timeout=30)
+    
+    if response.status_code != 200:
+        raise HTTPException(response.status_code, "Voice clone failed")
+    
+    timestamp = int(time.time() * 1000)
+    output_file = os.path.join(OUTPUT_DIR, f"clone_{timestamp}.mp3")
+    with open(output_file, "wb") as f:
+        f.write(response.content)
+    
+    return FileResponse(output_file, media_type="audio/mpeg", filename="cloned_speech.mp3")
+
+def get_kokoro():
+    if "kokoro" not in models_cache:
+        from kokoro import KPipeline
+        models_cache["kokoro"] = KPipeline(lang_code='a')
+    return models_cache["kokoro"]
+
+@api.post("/api/kokoro")
+async def generate_kokoro(req: TTSRequest):
+    if not req.text or not req.text.strip():
+        raise HTTPException(400, "Text is required")
     
     try:
-        communicate = edge_tts.Communicate(req.text, req.voice, rate=rate_str, pitch=pitch_str)
-        await communicate.save(output_file)
+        pipeline = get_kokoro()
+        timestamp = int(time.time() * 1000)
+        output_file = os.path.join(OUTPUT_DIR, f"kokoro_{timestamp}.wav")
         
-        file_size = os.path.getsize(output_file)
-        return {
-            "status": "done",
-            "file": output_file,
-            "size_kb": round(file_size / 1024, 1),
-            "voice": req.voice
-        }
+        import soundfile as sf
+        import numpy as np
+        
+        all_audio = []
+        for gs, ps, audio in pipeline(req.text, voice="af_heart"):
+            all_audio.append(np.array(audio))
+        
+        if all_audio:
+            final_audio = np.concatenate(all_audio)
+            sf.write(output_file, final_audio, 24000)
+            return FileResponse(output_file, media_type="audio/wav", filename="speech.wav")
+        else:
+            raise HTTPException(500, "No audio generated")
     except Exception as e:
         raise HTTPException(500, str(e))
 
 # ===== Gradio Interface =====
-def gradio_generate(text, voice_name, rate, pitch):
+
+def edge_generate(text, voice_name, rate, pitch):
     if not text or not text.strip():
         return None, "Please enter text!"
-    
     voice_id = MICROSOFT_VOICES.get(voice_name, "en-US-GuyNeural")
     rate_str = f"+{rate}%" if rate >= 0 else f"{rate}%"
     pitch_str = f"+{pitch}Hz" if pitch >= 0 else f"{pitch}Hz"
-    
     timestamp = int(time.time() * 1000)
     output_file = os.path.join(OUTPUT_DIR, f"gradio_{timestamp}.mp3")
-    
     try:
         asyncio.run(edge_tts.Communicate(text, voice_id, rate=rate_str, pitch=pitch_str).save(output_file))
         return output_file, f"Done! Voice: {voice_name}"
     except Exception as e:
         return None, f"Error: {str(e)}"
 
-with gr.Blocks(title="BG LABS TTS Studio") as gradio_app:
-    gr.Markdown("# BG LABS TTS Studio\n### Free Unlimited Text-to-Speech")
+def elevenlabs_generate(text, voice_name):
+    if not ELEVENLABS_API_KEY:
+        return None, "ElevenLabs API key not set!"
+    if not text or not text.strip():
+        return None, "Please enter text!"
     
-    with gr.Row():
-        with gr.Column(scale=2):
-            text_input = gr.Textbox(label="Text", lines=8, placeholder="Enter text here...")
-            voice_dropdown = gr.Dropdown(choices=list(MICROSOFT_VOICES.keys()), value="Guy (Male)", label="Voice")
-            rate_slider = gr.Slider(-50, 50, value=0, label="Speed")
-            pitch_slider = gr.Slider(-50, 50, value=0, label="Pitch")
-            gen_btn = gr.Button("Generate", variant="primary")
-        
-        with gr.Column(scale=1):
-            audio_out = gr.Audio(label="Audio", type="filepath")
-            status_out = gr.Textbox(label="Status")
+    voice_id = ELEVENLABS_VOICES.get(voice_name, "21m00Tcm4TlvDq8ikWAM")
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
+    payload = {"text": text, "model_id": "eleven_monolingual_v1", "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}}
     
-    gen_btn.click(fn=gradio_generate, inputs=[text_input, voice_dropdown, rate_slider, pitch_slider], outputs=[audio_out, status_out])
+    try:
+        response = httpx.post(url, json=payload, headers=headers, timeout=30)
+        if response.status_code != 200:
+            return None, f"ElevenLabs error: {response.status_code}"
+        timestamp = int(time.time() * 1000)
+        output_file = os.path.join(OUTPUT_DIR, f"eleven_{timestamp}.mp3")
+        with open(output_file, "wb") as f:
+            f.write(response.content)
+        return output_file, f"Done! ElevenLabs voice: {voice_name}"
+    except Exception as e:
+        return None, f"Error: {str(e)}"
 
-# ===== Run Both =====
-app = gradio_app
+def kokoro_generate(text, voice):
+    if not text or not text.strip():
+        return None, "Please enter text!"
+    try:
+        pipeline = get_kokoro()
+        timestamp = int(time.time() * 1000)
+        output_file = os.path.join(OUTPUT_DIR, f"kokoro_{timestamp}.wav")
+        import soundfile as sf
+        import numpy as np
+        all_audio = []
+        for gs, ps, audio in pipeline(text, voice=voice):
+            all_audio.append(np.array(audio))
+        if all_audio:
+            final_audio = np.concatenate(all_audio)
+            sf.write(output_file, final_audio, 24000)
+            return output_file, f"Done! Kokoro voice: {voice}"
+        return None, "No audio generated"
+    except Exception as e:
+        return None, f"Error: {str(e)}"
+
+with gr.Blocks(title="BG LABS TTS v3", css=".title{text-align:center;font-size:2em;font-weight:bold}") as demo:
+    gr.Markdown("# BG LABS TTS v3\n### ElevenLabs + Edge TTS + Kokoro | Voice Cloning | Free & Fast")
+    
+    with gr.Tabs():
+        with gr.TabItem("Edge TTS (Free Unlimited)"):
+            with gr.Row():
+                with gr.Column(scale=2):
+                    edge_text = gr.Textbox(label="Text", lines=6, placeholder="Enter text...")
+                    edge_voice = gr.Dropdown(choices=list(MICROSOFT_VOICES.keys()), value="Guy (Male)", label="Voice")
+                    edge_rate = gr.Slider(-50, 50, value=0, label="Speed")
+                    edge_pitch = gr.Slider(-50, 50, value=0, label="Pitch")
+                    edge_btn = gr.Button("Generate Edge TTS", variant="primary")
+                with gr.Column(scale=1):
+                    edge_audio = gr.Audio(label="Audio", type="filepath")
+                    edge_status = gr.Textbox(label="Status")
+            edge_btn.click(fn=edge_generate, inputs=[edge_text, edge_voice, edge_rate, edge_pitch], outputs=[edge_audio, edge_status])
+        
+        with gr.TabItem("ElevenLabs (Premium)"):
+            with gr.Row():
+                with gr.Column(scale=2):
+                    eleven_text = gr.Textbox(label="Text", lines=6, placeholder="Enter text...")
+                    eleven_voice = gr.Dropdown(choices=list(ELEVENLABS_VOICES.keys()), value="Rachel", label="Voice")
+                    eleven_btn = gr.Button("Generate ElevenLabs", variant="primary")
+                with gr.Column(scale=1):
+                    eleven_audio = gr.Audio(label="Audio", type="filepath")
+                    eleven_status = gr.Textbox(label="Status")
+            eleven_btn.click(fn=elevenlabs_generate, inputs=[eleven_text, eleven_voice], outputs=[eleven_audio, eleven_status])
+        
+        with gr.TabItem("Kokoro (Free Fast)"):
+            with gr.Row():
+                with gr.Column(scale=2):
+                    kokoro_text = gr.Textbox(label="Text", lines=6, placeholder="Enter text...")
+                    kokoro_voice = gr.Dropdown(choices=KOKORO_VOICES, value="af_heart", label="Voice")
+                    kokoro_btn = gr.Button("Generate Kokoro", variant="primary")
+                with gr.Column(scale=1):
+                    kokoro_audio = gr.Audio(label="Audio", type="filepath")
+                    kokoro_status = gr.Textbox(label="Status")
+            kokoro_btn.click(fn=kokoro_generate, inputs=[kokoro_text, kokoro_voice], outputs=[kokoro_audio, kokoro_status])
+    
+    gr.Markdown("""
+    ---
+    ### API Endpoints:
+    | Endpoint | Method | Description |
+    |----------|--------|-------------|
+    | `/api/tts` | POST | Edge TTS (Free) |
+    | `/api/elevenlabs` | POST | ElevenLabs (Premium) |
+    | `/api/kokoro` | POST | Kokoro (Free Fast) |
+    | `/api/voices` | GET | List all voices |
+    | `/api/health` | GET | Health check |
+    """)
+
+app = demo
 
 if __name__ == "__main__":
-    gradio_app.launch(server_name="0.0.0.0", server_port=7860)
+    demo.launch(server_name="0.0.0.0", server_port=7860)
